@@ -4,7 +4,7 @@
 Center for Mathematics and Society, Faculty of Science,  
 Parahyangan Catholic University (UNPAR), Bandung, West Java, Indonesia  
 robynirawan.tjia@unpar.ac.id
-
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21122084.svg)](https://doi.org/10.5281/zenodo.21122084)
 ---
 
 ## Overview
