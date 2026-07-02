@@ -1,0 +1,850 @@
+---
+title: "Monte Carlo Benchmarking of LGCP-INLA-SPDE: Parameter Recovery and Spatial Confounding"
+author: "Robyn Irawan"
+date: "2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r installation, eval=FALSE}
+# Run this chunk only once to install required packages.
+# INLA is not on CRAN and must be installed from the INLA repository.
+install.packages("INLA",
+  repos = c(getOption("repos"),
+            INLA = "https://inla.r-inla-download.org/R/stable"),
+  dep = TRUE, type = "binary")
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(c("graph", "Rgraphviz"), dep = TRUE)
+
+install.packages(c("sf", "spatstat", "spatstat.geom", "spatstat.random",
+                   "ggplot2", "viridis", "patchwork", "Matrix", "fields"))
+```
+
+```{r libraries}
+# Load packages and create output folders
+library(INLA)
+library(sf)
+library(spatstat)
+library(spatstat.geom)
+library(spatstat.random)
+library(ggplot2)
+library(viridis)
+library(patchwork)
+library(Matrix)
+library(fields)
+
+dir.create("outputs",               showWarnings = FALSE)
+dir.create("outputs/tables",        showWarnings = FALSE)
+dir.create("outputs/figures",       showWarnings = FALSE)
+dir.create("outputs/checkpoints",   showWarnings = FALSE)
+
+set.seed(888)
+
+cat("INLA version:", as.character(packageVersion("INLA")), "\n")
+
+save_csv <- function(df, filename) {
+  write.csv(df, file.path("outputs", "tables", filename), row.names = FALSE)
+}
+```
+
+```{r domain}
+# Define synthetic spatial domain S = [0,10]^2
+kanto_owin  <- owin(xrange = c(0, 10), yrange = c(0, 10))
+kanto_coords <- rbind(c(0,0), c(10,0), c(10,10), c(0,10), c(0,0))
+kanto_sf    <- st_sf(geometry = st_sfc(st_polygon(list(kanto_coords))),
+                     crs = st_crs(NA))
+```
+
+```{r reference_coordinates}
+# Habitat reference coordinate sets F_k (see Appendix A of the manuscript)
+water_refs <- data.frame(x = c(8.5, 9.0, 8.0, 4.0, 3.5, 6.0),
+                          y = c(4.0, 5.0, 6.0, 0.5, 1.0, 1.5))
+cave_refs  <- data.frame(x = c(6.5, 8.5, 4.0, 2.5, 5.5),
+                          y = c(5.5, 5.0, 1.0, 3.0, 3.5))
+grass_refs <- data.frame(x = c(5.0, 5.0, 4.5, 7.0),
+                          y = c(3.5, 2.5, 6.5, 6.0))
+
+appendix_coords <- rbind(
+  data.frame(Guild = "Water", Point_id = seq_len(nrow(water_refs)),
+             x = water_refs$x, y = water_refs$y),
+  data.frame(Guild = "Cave",  Point_id = seq_len(nrow(cave_refs)),
+             x = cave_refs$x,  y = cave_refs$y),
+  data.frame(Guild = "Grass", Point_id = seq_len(nrow(grass_refs)),
+             x = grass_refs$x, y = grass_refs$y)
+)
+save_csv(appendix_coords, "13_appendix_A_reference_coordinates.csv")
+```
+
+```{r covariates}
+# Build terrain-distance covariate images and standardise to zero mean, unit variance
+make_im <- function(refs, win, res = 128) {
+  xg <- seq(win$xrange[1], win$xrange[2], length.out = res)
+  yg <- seq(win$yrange[1], win$yrange[2], length.out = res)
+  mat <- outer(yg, xg, FUN = function(y, x)
+    mapply(function(xi, yi) min(sqrt((xi - refs$x)^2 + (yi - refs$y)^2)),
+           x, y))
+  im(mat, xcol = xg, yrow = yg)
+}
+
+interp_safe <- function(im_obj, x, y) {
+  v <- spatstat.geom::interp.im(im_obj, x = x, y = y)
+  v[is.na(v)] <- mean(v, na.rm = TRUE)
+  v
+}
+
+im_w <- make_im(water_refs, kanto_owin)
+im_c <- make_im(cave_refs,  kanto_owin)
+im_g <- make_im(grass_refs, kanto_owin)
+
+grid_std <- expand.grid(x = seq(0, 10, length.out = 128),
+                         y = seq(0, 10, length.out = 128))
+
+raw_w <- mapply(function(x, y) interp_safe(im_w, x, y), grid_std$x, grid_std$y)
+raw_c <- mapply(function(x, y) interp_safe(im_c, x, y), grid_std$x, grid_std$y)
+raw_g <- mapply(function(x, y) interp_safe(im_g, x, y), grid_std$x, grid_std$y)
+
+mean_w <- mean(raw_w); sd_w <- sd(raw_w)
+mean_c <- mean(raw_c); sd_c <- sd(raw_c)
+mean_g <- mean(raw_g); sd_g <- sd(raw_g)
+
+save_csv(data.frame(Guild = c("Water","Cave","Grass"),
+                    Raw_mean = c(mean_w, mean_c, mean_g),
+                    Raw_sd   = c(sd_w,   sd_c,   sd_g)),
+         "00_covariate_standardisation_stats.csv")
+
+make_im_std <- function(refs, win, mn, s, res = 128) {
+  xg <- seq(win$xrange[1], win$xrange[2], length.out = res)
+  yg <- seq(win$yrange[1], win$yrange[2], length.out = res)
+  mat <- outer(yg, xg, FUN = function(y, x)
+    mapply(function(xi, yi)
+      (min(sqrt((xi - refs$x)^2 + (yi - refs$y)^2)) - mn) / s, x, y))
+  im(mat, xcol = xg, yrow = yg)
+}
+
+im_w_std <- make_im_std(water_refs, kanto_owin, mean_w, sd_w)
+im_c_std <- make_im_std(cave_refs,  kanto_owin, mean_c, sd_c)
+im_g_std <- make_im_std(grass_refs, kanto_owin, mean_g, sd_g)
+```
+
+```{r matern_grf}
+# Simulate Matern GRFs via Cholesky decomposition (nu = 1)
+simulate_matern_grf <- function(range_true, sigma_true, win,
+                                 res = 50, seed_val) {
+  set.seed(seed_val)
+  xg    <- seq(win$xrange[1], win$xrange[2], length.out = res)
+  yg    <- seq(win$yrange[1], win$yrange[2], length.out = res)
+  cg    <- expand.grid(x = xg, y = yg)
+  kappa <- sqrt(8) / range_true
+  D     <- as.matrix(dist(cg[, 1:2]))
+  kh    <- kappa * D + 1e-8
+  Sigma <- sigma_true^2 * kh * besselK(kh, nu = 1)
+  diag(Sigma) <- sigma_true^2
+  L  <- chol(Sigma + diag(1e-6, res^2))
+  xi <- as.numeric(t(L) %*% rnorm(res^2))
+  im(matrix(xi, nrow = res, ncol = res, byrow = FALSE),
+     xcol = xg, yrow = yg)
+}
+
+grf_w <- simulate_matern_grf(2.0, 0.8, kanto_owin, seed_val = 2025)
+grf_c <- simulate_matern_grf(1.5, 1.0, kanto_owin, seed_val = 2026)
+grf_g <- simulate_matern_grf(2.5, 0.7, kanto_owin, seed_val = 2027)
+```
+
+```{r true_params}
+# True DGP parameters: log lambda_k(s) = beta0 + beta1 * X_k(s) + xi_k(s)
+TRUE_PARAMS <- list(
+  water = list(alpha0 =  0.0, alpha1 = -1.5, range = 2.0, sigma = 0.8),
+  cave  = list(alpha0 = -0.7, alpha1 = -2.0, range = 1.5, sigma = 1.0),
+  grass = list(alpha0 = -0.5, alpha1 = -1.2, range = 2.5, sigma = 0.7)
+)
+
+set.seed(888)
+
+water_ppp <- rpoispp(
+  lambda = function(x, y)
+    pmax(0, exp(TRUE_PARAMS$water$alpha0
+               + TRUE_PARAMS$water$alpha1 * interp_safe(im_w_std, x, y)
+               + interp_safe(grf_w, x, y))),
+  win = kanto_owin)
+
+cave_ppp <- rpoispp(
+  lambda = function(x, y)
+    pmax(0, exp(TRUE_PARAMS$cave$alpha0
+               + TRUE_PARAMS$cave$alpha1 * interp_safe(im_c_std, x, y)
+               + interp_safe(grf_c, x, y))),
+  win = kanto_owin)
+
+grass_ppp <- rpoispp(
+  lambda = function(x, y)
+    pmax(0, exp(TRUE_PARAMS$grass$alpha0
+               + TRUE_PARAMS$grass$alpha1 * interp_safe(im_g_std, x, y)
+               + interp_safe(grf_g, x, y))),
+  win = kanto_owin)
+
+save_csv(data.frame(Guild = c("Water","Cave","Grass"),
+                    N_encounters = c(npoints(water_ppp),
+                                     npoints(cave_ppp),
+                                     npoints(grass_ppp))),
+         "00_reference_encounter_counts.csv")
+```
+
+```{r mesh}
+# Constrained refined Delaunay triangulation over S
+bnd  <- inla.mesh.segment(kanto_coords[-5, ])
+mesh <- inla.mesh.2d(boundary = bnd,
+                      max.edge = c(0.35, 1.0),
+                      offset   = c(0.5,  1.8),
+                      cutoff   = 0.18)
+cat("Mesh:", mesh$n, "nodes,", nrow(mesh$graph$tv), "triangles\n")
+```
+
+```{r spde}
+# SPDE representation with Penalised Complexity priors
+# P(rho < 2.0) = 0.5 ; P(sigma > 1.0) = 0.5
+spde <- inla.spde2.pcmatern(mesh        = mesh,
+                              alpha       = 2,
+                              prior.range = c(2.0, 0.50),
+                              prior.sigma = c(1.0, 0.50))
+```
+
+```{r voronoi_weights}
+# Voronoi dual-mesh integration weights (Simpson et al. 2016)
+book.mesh.dual <- function(mesh) {
+  tv <- mesh$graph$tv
+  ce <- t(sapply(seq_len(nrow(tv)), function(i)
+    colMeans(mesh$loc[tv[i, ], 1:2])))
+  pls <- lapply(seq_len(mesh$n), function(i) {
+    p <- unique(Reduce("rbind", lapply(1:3, function(k) {
+      j <- which(tv[, k] == i)
+      if (length(j) == 0) return(NULL)
+      rbind(ce[j, , drop = FALSE],
+            0.5 * (mesh$loc[tv[j, k], 1:2] +
+                   mesh$loc[tv[j, setdiff(1:3, k)[1]], 1:2]),
+            0.5 * (mesh$loc[tv[j, k], 1:2] +
+                   mesh$loc[tv[j, setdiff(1:3, k)[2]], 1:2]))
+    })))
+    j1 <- which(mesh$segm$bnd$idx[, 1] == i)
+    j2 <- which(mesh$segm$bnd$idx[, 2] == i)
+    if (length(j1) > 0)
+      p <- unique(rbind(p,
+        0.5 * (mesh$loc[mesh$segm$bnd$idx[j1, 1], 1:2] +
+               mesh$loc[mesh$segm$bnd$idx[j1, 2], 1:2]),
+        0.5 * (mesh$loc[mesh$segm$bnd$idx[j2, 1], 1:2] +
+               mesh$loc[mesh$segm$bnd$idx[j2, 2], 1:2])))
+    p <- p[chull(p), ]
+    sp::Polygon(rbind(p, p[1, ]))
+  })
+  sp::SpatialPolygons(lapply(seq_along(pls), function(i)
+    sp::Polygons(list(pls[[i]]), i)))
+}
+
+dmesh   <- book.mesh.dual(mesh)
+dmesh_sf <- st_as_sf(dmesh)
+kanto_v  <- st_make_valid(kanto_sf)
+
+w_vec <- numeric(mesh$n)
+for (i in seq_len(mesh$n)) {
+  tryCatch({
+    inter    <- st_intersection(st_make_valid(dmesh_sf[i, ]), kanto_v)
+    w_vec[i] <- if (nrow(inter) > 0) as.numeric(st_area(inter)) else 0
+  }, error = function(e) { w_vec[i] <<- 0 })
+}
+
+save_csv(data.frame(Total_nodes       = mesh$n,
+                    Active_nodes      = sum(w_vec > 0),
+                    Total_triangles   = nrow(mesh$graph$tv),
+                    Integration_total = round(sum(w_vec), 4),
+                    Domain_area       = 100),
+         "00_mesh_diagnostics.csv")
+cat("Active nodes:", sum(w_vec > 0), "| Integration total:", round(sum(w_vec), 2), "\n")
+```
+
+```{r fit_function}
+# Core LGCP fitting function: Poisson GLMM reformulation via INLA-SPDE
+fit_lgcp_inla <- function(ppp_obj, dist_im, guild_name, mesh, spde, w_vec) {
+  n_obs  <- npoints(ppp_obj)
+  n_mesh <- mesh$n
+  cov_obs  <- interp_safe(dist_im, ppp_obj$x, ppp_obj$y)
+  cov_mesh <- interp_safe(dist_im, mesh$loc[, 1], mesh$loc[, 2])
+  A_obs <- inla.spde.make.A(mesh = mesh, loc = cbind(ppp_obj$x, ppp_obj$y))
+  A_int <- Diagonal(n = n_mesh)
+
+  stk_obs <- inla.stack(
+    data    = list(y = rep(1L, n_obs), E = rep(0, n_obs)),
+    A       = list(A_obs, 1),
+    effects = list(s = seq_len(spde$n.spde),
+                   data.frame(intercept = 1, dist_cov = cov_obs)),
+    tag = "obs")
+  stk_int <- inla.stack(
+    data    = list(y = rep(0L, n_mesh), E = w_vec),
+    A       = list(A_int, 1),
+    effects = list(s = seq_len(spde$n.spde),
+                   data.frame(intercept = 1, dist_cov = cov_mesh)),
+    tag = "int")
+  stk_all <- inla.stack(stk_obs, stk_int)
+
+  t0  <- proc.time()
+  fit <- inla(y ~ -1 + intercept + dist_cov + f(s, model = spde),
+              family  = "poisson",
+              data    = inla.stack.data(stk_all),
+              E       = inla.stack.data(stk_all)$E,
+              control.predictor = list(A = inla.stack.A(stk_all),
+                                       compute = TRUE, link = 1),
+              control.compute   = list(dic = TRUE, waic = TRUE,
+                                       cpo = TRUE, config = TRUE),
+              control.inla      = list(strategy     = "laplace",
+                                       int.strategy = "eb"),
+              verbose = FALSE)
+  cat(guild_name, "| fitted in", round((proc.time()-t0)["elapsed"], 1),
+      "sec | WAIC:", round(fit$waic$waic, 2), "\n")
+  list(fit = fit, stk = stk_all, cov_mesh = cov_mesh)
+}
+```
+
+```{r reference_fits}
+# Reference run: single-seed fits for all three guilds
+res_w <- fit_lgcp_inla(water_ppp, im_w_std, "Water", mesh, spde, w_vec)
+res_c <- fit_lgcp_inla(cave_ppp,  im_c_std, "Cave",  mesh, spde, w_vec)
+res_g <- fit_lgcp_inla(grass_ppp, im_g_std, "Grass", mesh, spde, w_vec)
+
+fit_w <- res_w$fit; fit_c <- res_c$fit; fit_g <- res_g$fit
+
+# Null model: retains SPDE field, drops terrain covariate
+# log lambda(s) = beta0 + xi(s)  [covariate excluded]
+fit_null_lgcp <- function(ppp_obj, mesh, spde, w_vec) {
+  n_obs  <- npoints(ppp_obj)
+  n_mesh <- mesh$n
+  A_obs  <- inla.spde.make.A(mesh, cbind(ppp_obj$x, ppp_obj$y))
+  A_int  <- Diagonal(n = n_mesh)
+  stk_obs <- inla.stack(
+    data    = list(y = rep(1L, n_obs), E = rep(0, n_obs)),
+    A       = list(A_obs, 1),
+    effects = list(s = seq_len(spde$n.spde),
+                   data.frame(intercept = rep(1, n_obs))),
+    tag = "obs_null")
+  stk_int <- inla.stack(
+    data    = list(y = rep(0L, n_mesh), E = w_vec),
+    A       = list(A_int, 1),
+    effects = list(s = seq_len(spde$n.spde),
+                   data.frame(intercept = rep(1, n_mesh))),
+    tag = "int_null")
+  stk_null <- inla.stack(stk_obs, stk_int)
+  tryCatch(
+    inla(y ~ -1 + intercept + f(s, model = spde),
+         family  = "poisson",
+         data    = inla.stack.data(stk_null),
+         E       = inla.stack.data(stk_null)$E,
+         control.predictor = list(A = inla.stack.A(stk_null),
+                                   compute = TRUE, link = 1),
+         control.compute   = list(waic = TRUE, dic = TRUE),
+         control.inla      = list(strategy = "laplace",
+                                   int.strategy = "eb"),
+         verbose = FALSE),
+    error = function(e) NULL)
+}
+
+null_w <- fit_null_lgcp(water_ppp, mesh, spde, w_vec)
+null_c <- fit_null_lgcp(cave_ppp,  mesh, spde, w_vec)
+null_g <- fit_null_lgcp(grass_ppp, mesh, spde, w_vec)
+
+delta_waic <- data.frame(
+  Guild      = c("Water", "Cave", "Grass"),
+  WAIC_cov   = c(fit_w$waic$waic, fit_c$waic$waic, fit_g$waic$waic),
+  WAIC_null  = c(null_w$waic$waic, null_c$waic$waic, null_g$waic$waic))
+delta_waic$Delta_WAIC <- round(delta_waic$WAIC_null - delta_waic$WAIC_cov, 2)
+save_csv(delta_waic, "05_reference_delta_waic.csv")
+print(delta_waic, row.names = FALSE)
+```
+
+```{r prior_sensitivity}
+# PC prior sensitivity analysis: four specifications for the Water guild
+prior_grid <- list(
+  list(range = c(1.0, 0.5), sigma = c(0.5, 0.5), label = "Tight"),
+  list(range = c(2.0, 0.5), sigma = c(1.0, 0.5), label = "Base"),
+  list(range = c(3.0, 0.5), sigma = c(1.0, 0.5), label = "Wide range"),
+  list(range = c(2.0, 0.5), sigma = c(2.0, 0.5), label = "Wide sigma"))
+
+sens_df <- do.call(rbind, lapply(prior_grid, function(pr) {
+  sp   <- inla.spde2.pcmatern(mesh, alpha = 2,
+            prior.range = pr$range, prior.sigma = pr$sigma)
+  res  <- fit_lgcp_inla(water_ppp, im_w_std, pr$label, mesh, sp, w_vec)
+  spr  <- inla.spde2.result(res$fit, "s", sp, do.transform = TRUE)
+  data.frame(Prior      = pr$label,
+             rho0       = pr$range[1],
+             alpha_rho  = pr$range[2],
+             sigma0     = pr$sigma[1],
+             alpha_sig  = pr$sigma[2],
+             range_mean = round(inla.emarginal(function(x) x,
+                                spr$marginals.range.nominal[[1]]), 3),
+             beta1_mean = round(res$fit$summary.fixed["dist_cov","mean"], 3),
+             WAIC       = round(res$fit$waic$waic, 2))
+}))
+save_csv(sens_df, "06_pc_prior_sensitivity.csv")
+print(sens_df, row.names = FALSE)
+```
+
+```{r reference_summaries}
+# Reference run: fixed effects and hyperparameter summaries
+fixed_eff_df <- do.call(rbind, lapply(
+  list(W = fit_w, C = fit_c, G = fit_g), function(fit) {
+    out <- as.data.frame(fit$summary.fixed[,
+              c("mean","sd","0.025quant","0.975quant")])
+    out$parameter <- rownames(fit$summary.fixed); out
+}))
+fixed_eff_df$Guild <- rep(c("Water","Cave","Grass"), each = 2)
+save_csv(fixed_eff_df, "01_reference_fixed_effects.csv")
+
+extract_params <- function(fit, spde, guild) {
+  fx  <- fit$summary.fixed
+  spr <- inla.spde2.result(fit, "s", spde, do.transform = TRUE)
+  data.frame(Guild      = guild,
+             beta1_mean = round(fx["dist_cov","mean"], 3),
+             beta1_sd   = round(fx["dist_cov","sd"],   3),
+             range_mean = round(inla.emarginal(function(x) x,
+                                spr$marginals.range.nominal[[1]]), 3),
+             sigma_mean = round(sqrt(max(0, inla.emarginal(function(x) x,
+                                spr$marginals.variance.nominal[[1]]))), 3),
+             WAIC = round(fit$waic$waic, 2))
+}
+
+param_table <- rbind(extract_params(fit_w, spde, "Water"),
+                     extract_params(fit_c, spde, "Cave"),
+                     extract_params(fit_g, spde, "Grass"))
+true_vals <- data.frame(Guild      = c("Water","Cave","Grass"),
+                         True_beta1 = c(-1.5, -2.0, -1.2),
+                         True_range = c( 2.0,  1.5,  2.5),
+                         True_sigma = c( 0.8,  1.0,  0.7))
+recovery <- merge(param_table, true_vals, by = "Guild")
+recovery$bias_beta1 <- round(recovery$beta1_mean - recovery$True_beta1, 3)
+recovery$bias_range <- round(recovery$range_mean  - recovery$True_range, 3)
+recovery$bias_sigma <- round(recovery$sigma_mean  - recovery$True_sigma, 3)
+save_csv(recovery, "03_reference_recovery.csv")
+print(recovery[, c("Guild","True_beta1","beta1_mean","bias_beta1",
+                    "True_range","range_mean","bias_range",
+                    "True_sigma","sigma_mean","bias_sigma")],
+      row.names = FALSE)
+```
+
+```{r intensity_maps}
+# Posterior intensity surfaces and GRF uncertainty (Figure 1 and Figure 2)
+predict_intensity <- function(fit, dist_im, mesh, res = 80) {
+  pgrid <- expand.grid(x = seq(0,10,length.out=res),
+                        y = seq(0,10,length.out=res))
+  pgrid$dist_cov <- interp_safe(dist_im, pgrid$x, pgrid$y)
+  A_pred   <- inla.spde.make.A(mesh, as.matrix(pgrid[, c("x","y")]))
+  xi_pm    <- as.numeric(A_pred %*% fit$summary.random$s$mean)
+  xi_sd    <- as.numeric(A_pred %*% fit$summary.random$s$sd)
+  bh       <- fit$summary.fixed$mean
+  names(bh) <- rownames(fit$summary.fixed)
+  pgrid$lam   <- exp(bh["intercept"] + bh["dist_cov"]*pgrid$dist_cov + xi_pm)
+  pgrid$xi_sd <- xi_sd
+  pgrid
+}
+
+pred_w <- predict_intensity(fit_w, im_w_std, mesh)
+pred_c <- predict_intensity(fit_c, im_c_std, mesh)
+pred_g <- predict_intensity(fit_g, im_g_std, mesh)
+
+make_int_plot <- function(pred, ppp_obj, title_str, pal = "plasma") {
+  ggplot() +
+    geom_raster(data = pred, aes(x, y, fill = lam)) +
+    geom_point(data = data.frame(x = ppp_obj$x, y = ppp_obj$y),
+               aes(x, y), colour = "white", size = 0.4, alpha = 0.5) +
+    scale_fill_viridis_c(option = pal, trans = "sqrt",
+                          name = expression(hat(lambda)(bold(s)))) +
+    labs(title = title_str, x = "Easting (norm.)", y = "Northing (norm.)") +
+    theme_minimal(base_size = 11) + coord_fixed(xlim=c(0,10), ylim=c(0,10))
+}
+
+fig1 <- make_int_plot(pred_w, water_ppp, "Water-type",      "mako")    |
+        make_int_plot(pred_c, cave_ppp,  "Rock/Cave-type",  "inferno") |
+        make_int_plot(pred_g, grass_ppp, "Grass/Normal-type","viridis")
+ggsave("outputs/figures/fig01_intensity_maps.pdf", fig1,
+       width = 15, height = 5, dpi = 300)
+
+make_sd_plot <- function(pred, title_str)
+  ggplot() +
+    geom_raster(data = pred, aes(x, y, fill = xi_sd)) +
+    scale_fill_viridis_c(option = "cividis",
+                          name = expression(SD(hat(xi)(bold(s))))) +
+    labs(title = title_str, x = "Easting (norm.)", y = "Northing (norm.)") +
+    theme_minimal(base_size = 11) + coord_fixed(xlim=c(0,10), ylim=c(0,10))
+
+fig2 <- make_sd_plot(pred_w, "Water-type: GRF SD") |
+        make_sd_plot(pred_c, "Rock/Cave-type: GRF SD") |
+        make_sd_plot(pred_g, "Grass/Normal-type: GRF SD")
+ggsave("outputs/figures/fig02_uncertainty_maps.pdf", fig2,
+       width = 15, height = 5, dpi = 300)
+```
+
+```{r marginal_posteriors}
+# Marginal posterior distributions for the reference run (Figure 3)
+pdf("outputs/figures/fig03_marginal_posteriors.pdf", width = 15, height = 9)
+par(mfrow = c(3, 4), mar = c(4, 4, 2, 1))
+
+plot_marginal <- function(marg, true_val, main_str, xlab_str) {
+  plot(marg, type = "l", lwd = 2, col = "steelblue",
+       main = main_str, xlab = xlab_str, ylab = "density")
+  abline(v = true_val, col = "red", lty = 2, lwd = 1.5)
+}
+
+for (gi in list(
+  list(fit=fit_w, label="Water", b0= 0.0, b1=-1.5, rg=2.0, sg=0.8),
+  list(fit=fit_c, label="Cave",  b0=-0.7, b1=-2.0, rg=1.5, sg=1.0),
+  list(fit=fit_g, label="Grass", b0=-0.5, b1=-1.2, rg=2.5, sg=0.7))) {
+  spr <- inla.spde2.result(gi$fit, "s", spde, do.transform = TRUE)
+  plot_marginal(gi$fit$marginals.fixed[["intercept"]], gi$b0,
+                paste(gi$label, "beta0"), expression(beta[0]))
+  plot_marginal(gi$fit$marginals.fixed[["dist_cov"]], gi$b1,
+                paste(gi$label, "beta1"), expression(beta[1]))
+  plot_marginal(spr$marginals.range.nominal[[1]], gi$rg,
+                paste(gi$label, "range"), "Range")
+  plot_marginal(spr$marginals.variance.nominal[[1]], gi$sg^2,
+                paste(gi$label, "sigma^2"), expression(sigma^2))
+}
+dev.off()
+par(mfrow = c(1, 1))
+```
+
+```{r simulation_setup}
+# Monte Carlo simulation: N_REP = 500 replicates
+# MC standard error on coverage <= sqrt(0.25/500) = 2.24 percentage points
+N_REP <- 500
+
+fit_null_one <- function(ppp_obj, mesh, spde, w_vec) {
+  n_obs  <- npoints(ppp_obj)
+  n_mesh <- mesh$n
+  A_obs  <- inla.spde.make.A(mesh, cbind(ppp_obj$x, ppp_obj$y))
+  A_int  <- Diagonal(n = n_mesh)
+  stk_obs <- inla.stack(
+    data    = list(y = rep(1L, n_obs), E = rep(0, n_obs)),
+    A       = list(A_obs, 1),
+    effects = list(s = seq_len(spde$n.spde),
+                   data.frame(intercept = rep(1, n_obs))),
+    tag = "obs_null")
+  stk_int <- inla.stack(
+    data    = list(y = rep(0L, n_mesh), E = w_vec),
+    A       = list(A_int, 1),
+    effects = list(s = seq_len(spde$n.spde),
+                   data.frame(intercept = rep(1, n_mesh))),
+    tag = "int_null")
+  stk_null <- inla.stack(stk_obs, stk_int)
+  tryCatch(
+    inla(y ~ -1 + intercept + f(s, model = spde),
+         family = "poisson",
+         data   = inla.stack.data(stk_null),
+         E      = inla.stack.data(stk_null)$E,
+         control.predictor = list(A = inla.stack.A(stk_null),
+                                   compute = TRUE, link = 1),
+         control.compute   = list(waic = TRUE, dic = TRUE),
+         control.inla      = list(strategy = "laplace",
+                                   int.strategy = "eb"),
+         verbose = FALSE),
+    error = function(e) NULL)
+}
+
+extract_guild <- function(res_obj, null_obj,
+                           true_beta1, true_range, true_sigma, guild) {
+  empty <- data.frame(Guild=guild, b1_mean=NA, b1_sd=NA,
+                      b1_lo=NA, b1_hi=NA, b1_covered=NA,
+                      range_mean=NA, range_lo=NA, range_hi=NA,
+                      range_covered=NA, sigma_mean=NA, sigma_lo=NA,
+                      sigma_hi=NA, sigma_covered=NA,
+                      WAIC_cov=NA, WAIC_null=NA, Delta_WAIC=NA, logCPO=NA)
+  if (is.null(res_obj) || is.null(res_obj$fit)) return(empty)
+  fit <- res_obj$fit
+  fx  <- fit$summary.fixed
+  spr <- tryCatch(inla.spde2.result(fit, "s", spde, do.transform=TRUE),
+                   error = function(e) NULL)
+  if (is.null(spr)) return(empty)
+  rm  <- spr$marginals.range.nominal[[1]]
+  sm  <- spr$marginals.variance.nominal[[1]]
+  rci <- tryCatch(inla.hpdmarginal(0.95, rm),
+                   error = function(e) matrix(c(NA,NA), nrow=1))
+  sci <- tryCatch(inla.hpdmarginal(0.95, sm),
+                   error = function(e) matrix(c(NA,NA), nrow=1))
+  r_m <- inla.emarginal(function(x) x, rm)
+  s_m <- sqrt(max(0, inla.emarginal(function(x) x, sm)))
+  data.frame(
+    Guild         = guild,
+    b1_mean       = fx["dist_cov","mean"],
+    b1_sd         = fx["dist_cov","sd"],
+    b1_lo         = fx["dist_cov","0.025quant"],
+    b1_hi         = fx["dist_cov","0.975quant"],
+    b1_covered    = !is.na(fx["dist_cov","0.025quant"]) &&
+                     true_beta1 >= fx["dist_cov","0.025quant"] &
+                     true_beta1 <= fx["dist_cov","0.975quant"],
+    range_mean    = r_m,
+    range_lo      = rci[1,1], range_hi = rci[1,2],
+    range_covered = !is.na(rci[1,1]) &&
+                     true_range >= rci[1,1] & true_range <= rci[1,2],
+    sigma_mean    = s_m,
+    sigma_lo      = sqrt(max(0, sci[1,1])),
+    sigma_hi      = sqrt(max(0, sci[1,2])),
+    sigma_covered = !is.na(sci[1,1]) &&
+                     true_sigma >= sqrt(max(0,sci[1,1])) &
+                     true_sigma <= sqrt(max(0,sci[1,2])),
+    WAIC_cov      = if (!is.null(fit$waic)) fit$waic$waic else NA,
+    WAIC_null     = if (!is.null(null_obj$waic)) null_obj$waic$waic else NA,
+    Delta_WAIC    = if (!is.null(fit$waic) && !is.null(null_obj$waic))
+                      null_obj$waic$waic - fit$waic$waic else NA,
+    logCPO        = if (!is.null(fit$cpo))
+                      sum(log(fit$cpo$cpo), na.rm=TRUE) else NA)
+}
+```
+
+```{r simulation_loop}
+# Main Monte Carlo loop (expected runtime: 5-7 hours at 500 replicates)
+all_results  <- vector("list", N_REP)
+t_loop_start <- proc.time()
+
+for (rep in seq_len(N_REP)) {
+  grf_w_r <- simulate_matern_grf(TRUE_PARAMS$water$range,
+                                   TRUE_PARAMS$water$sigma,
+                                   kanto_owin, seed_val = 10000 + rep*3)
+  grf_c_r <- simulate_matern_grf(TRUE_PARAMS$cave$range,
+                                   TRUE_PARAMS$cave$sigma,
+                                   kanto_owin, seed_val = 10001 + rep*3)
+  grf_g_r <- simulate_matern_grf(TRUE_PARAMS$grass$range,
+                                   TRUE_PARAMS$grass$sigma,
+                                   kanto_owin, seed_val = 10002 + rep*3)
+  set.seed(20000 + rep)
+
+  water_r <- rpoispp(
+    lambda = function(x, y)
+      pmax(0, exp(TRUE_PARAMS$water$alpha0
+                 + TRUE_PARAMS$water$alpha1 * interp_safe(im_w_std, x, y)
+                 + interp_safe(grf_w_r, x, y))),
+    win = kanto_owin)
+  cave_r <- rpoispp(
+    lambda = function(x, y)
+      pmax(0, exp(TRUE_PARAMS$cave$alpha0
+                 + TRUE_PARAMS$cave$alpha1 * interp_safe(im_c_std, x, y)
+                 + interp_safe(grf_c_r, x, y))),
+    win = kanto_owin)
+  grass_r <- rpoispp(
+    lambda = function(x, y)
+      pmax(0, exp(TRUE_PARAMS$grass$alpha0
+                 + TRUE_PARAMS$grass$alpha1 * interp_safe(im_g_std, x, y)
+                 + interp_safe(grf_g_r, x, y))),
+    win = kanto_owin)
+
+  if (min(npoints(water_r), npoints(cave_r), npoints(grass_r)) < 5) {
+    cat("Rep", rep, "skipped: too few encounters\n")
+    all_results[[rep]] <- NULL; next
+  }
+
+  rw <- tryCatch(fit_lgcp_inla(water_r, im_w_std, "W", mesh, spde, w_vec),
+                  error = function(e) NULL)
+  rc <- tryCatch(fit_lgcp_inla(cave_r,  im_c_std, "C", mesh, spde, w_vec),
+                  error = function(e) NULL)
+  rg <- tryCatch(fit_lgcp_inla(grass_r, im_g_std, "G", mesh, spde, w_vec),
+                  error = function(e) NULL)
+
+  all_results[[rep]] <- list(
+    rep   = rep,
+    n_enc = c(npoints(water_r), npoints(cave_r), npoints(grass_r)),
+    water = extract_guild(rw, fit_null_one(water_r, mesh, spde, w_vec),
+                          TRUE_PARAMS$water$alpha1, TRUE_PARAMS$water$range,
+                          TRUE_PARAMS$water$sigma, "Water"),
+    cave  = extract_guild(rc, fit_null_one(cave_r,  mesh, spde, w_vec),
+                          TRUE_PARAMS$cave$alpha1,  TRUE_PARAMS$cave$range,
+                          TRUE_PARAMS$cave$sigma,  "Cave"),
+    grass = extract_guild(rg, fit_null_one(grass_r, mesh, spde, w_vec),
+                          TRUE_PARAMS$grass$alpha1, TRUE_PARAMS$grass$range,
+                          TRUE_PARAMS$grass$sigma, "Grass"))
+
+  if (rep %% 25 == 0) {
+    elapsed <- round((proc.time()-t_loop_start)["elapsed"]/60, 1)
+    cat("Rep", rep, "/", N_REP, "| Total:", elapsed, "min\n")
+    save(all_results,
+         file = file.path("outputs","checkpoints",
+                          paste0("checkpoint_rep", rep, ".RData")))
+  }
+}
+cat("Loop complete in",
+    round((proc.time()-t_loop_start)["elapsed"]/60, 1), "min\n")
+```
+
+```{r aggregation}
+# Aggregate results and compute Monte Carlo standard errors
+valid_results <- Filter(Negate(is.null), all_results)
+n_valid       <- length(valid_results)
+cat("Valid replicates:", n_valid, "/", N_REP, "\n")
+
+df_w <- do.call(rbind, lapply(valid_results, function(r) r$water))
+df_c <- do.call(rbind, lapply(valid_results, function(r) r$cave))
+df_g <- do.call(rbind, lapply(valid_results, function(r) r$grass))
+
+save_csv(df_w, "09_simulation_by_replicate_water.csv")
+save_csv(df_c, "10_simulation_by_replicate_cave.csv")
+save_csv(df_g, "11_simulation_by_replicate_grass.csv")
+
+cov_mcse <- function(p_hat, n) 100 * sqrt(p_hat * (1 - p_hat) / n)
+
+summarise_guild <- function(df, tb1, trg, tsg, guild) {
+  n  <- sum(!is.na(df$b1_mean))
+  cb <- mean(df$b1_covered,    na.rm=TRUE)
+  cr <- mean(df$range_covered, na.rm=TRUE)
+  cs <- mean(df$sigma_covered, na.rm=TRUE)
+  data.frame(
+    Guild          = guild, N_valid = n,
+    True_beta1     = tb1,
+    Mean_beta1     = round(mean(df$b1_mean, na.rm=TRUE), 3),
+    Bias_beta1     = round(mean(df$b1_mean - tb1, na.rm=TRUE), 3),
+    RMSE_beta1     = round(sqrt(mean((df$b1_mean-tb1)^2, na.rm=TRUE)), 3),
+    Coverage_beta1 = round(100*cb, 1),
+    MCSE_beta1     = round(cov_mcse(cb, n), 2),
+    True_range     = trg,
+    Mean_range     = round(mean(df$range_mean, na.rm=TRUE), 3),
+    Bias_range     = round(mean(df$range_mean-trg, na.rm=TRUE), 3),
+    RMSE_range     = round(sqrt(mean((df$range_mean-trg)^2, na.rm=TRUE)), 3),
+    Coverage_range = round(100*cr, 1),
+    MCSE_range     = round(cov_mcse(cr, n), 2),
+    True_sigma     = tsg,
+    Mean_sigma     = round(mean(df$sigma_mean, na.rm=TRUE), 3),
+    Bias_sigma     = round(mean(df$sigma_mean-tsg, na.rm=TRUE), 3),
+    RMSE_sigma     = round(sqrt(mean((df$sigma_mean-tsg)^2, na.rm=TRUE)), 3),
+    Coverage_sigma = round(100*cs, 1),
+    MCSE_sigma     = round(cov_mcse(cs, n), 2),
+    Mean_dWAIC     = round(mean(df$Delta_WAIC, na.rm=TRUE), 2),
+    SD_dWAIC       = round(sd(df$Delta_WAIC,   na.rm=TRUE), 2),
+    Pct_cov_better = round(100*mean(df$Delta_WAIC>0, na.rm=TRUE), 1))
+}
+
+sim_summary <- rbind(
+  summarise_guild(df_w, -1.5, 2.0, 0.8, "Water"),
+  summarise_guild(df_c, -2.0, 1.5, 1.0, "Cave"),
+  summarise_guild(df_g, -1.2, 2.5, 0.7, "Grass"))
+
+save_csv(sim_summary, "07_simulation_summary.csv")
+print(sim_summary[, c("Guild","Coverage_beta1","MCSE_beta1",
+                       "Coverage_range","MCSE_range",
+                       "Coverage_sigma","MCSE_sigma",
+                       "Mean_dWAIC","Pct_cov_better")], row.names=FALSE)
+```
+
+```{r figures}
+# Publication figures: parameter recovery (Figure 4) and diagnostics (Figure 5)
+make_box <- function(est_vec, true_vec, guilds, ylab_expr, title_expr) {
+  df <- data.frame(Guild = factor(guilds, levels=c("Water","Cave","Grass")),
+                   est   = est_vec, true = true_vec)
+  ggplot(df, aes(Guild, est, fill=Guild)) +
+    geom_boxplot(alpha=0.7, outlier.size=1.2) +
+    geom_hline(data=unique(df[,c("Guild","true")]),
+               aes(yintercept=true, colour=Guild),
+               linetype="dashed", linewidth=1) +
+    scale_fill_manual(values=c("Water"="#4FC3F7","Cave"="#BCAAA4","Grass"="#A5D6A7")) +
+    scale_colour_manual(values=c("Water"="#0277BD","Cave"="#5D4037","Grass"="#2E7D32")) +
+    labs(title=title_expr, subtitle="Dashed = true value",
+         x="Guild", y=ylab_expr) +
+    theme_minimal(base_size=12) + theme(legend.position="none")
+}
+
+fig4 <- make_box(c(df_w$b1_mean,  df_c$b1_mean,  df_g$b1_mean),
+                  rep(c(-1.5,-2.0,-1.2), each=n_valid),
+                  rep(c("Water","Cave","Grass"), each=n_valid),
+                  expression(hat(beta)[1]),
+                  expression(paste(hat(beta)[1], " across replicates"))) |
+        make_box(c(df_w$range_mean, df_c$range_mean, df_g$range_mean),
+                  rep(c(2.0,1.5,2.5), each=n_valid),
+                  rep(c("Water","Cave","Grass"), each=n_valid),
+                  expression(hat(rho)),
+                  expression(paste(hat(rho), " across replicates")))   |
+        make_box(c(df_w$sigma_mean, df_c$sigma_mean, df_g$sigma_mean),
+                  rep(c(0.8,1.0,0.7), each=n_valid),
+                  rep(c("Water","Cave","Grass"), each=n_valid),
+                  expression(hat(sigma)),
+                  expression(paste(hat(sigma), " across replicates")))
+fig4 <- fig4 + plot_annotation(
+  title    = paste0("Parameter Recovery: ", n_valid, "-Replicate Simulation Study"),
+  subtitle = "Kanto LGCP-INLA-SPDE",
+  theme    = theme(plot.title=element_text(size=14,face="bold")))
+ggsave("outputs/figures/fig04_parameter_recovery.pdf",
+       fig4, width=15, height=6, dpi=300)
+
+cov_df <- rbind(
+  data.frame(Guild=sim_summary$Guild, Parameter="beta[1]",
+             Coverage=sim_summary$Coverage_beta1, MCSE=sim_summary$MCSE_beta1),
+  data.frame(Guild=sim_summary$Guild, Parameter="rho",
+             Coverage=sim_summary$Coverage_range, MCSE=sim_summary$MCSE_range),
+  data.frame(Guild=sim_summary$Guild, Parameter="sigma",
+             Coverage=sim_summary$Coverage_sigma, MCSE=sim_summary$MCSE_sigma))
+cov_df$Guild     <- factor(cov_df$Guild, levels=c("Water","Cave","Grass"))
+cov_df$Parameter <- factor(cov_df$Parameter,
+                             levels=c("beta[1]","rho","sigma"))
+cov_df$ymin <- pmax(0,   cov_df$Coverage - cov_df$MCSE)
+cov_df$ymax <- pmin(100, cov_df$Coverage + cov_df$MCSE)
+
+p_cov <- ggplot(cov_df, aes(Guild, Coverage, fill=Guild)) +
+  geom_col(alpha=0.75, width=0.6) +
+  geom_errorbar(aes(ymin=ymin, ymax=ymax), width=0.2, colour="gray30") +
+  geom_hline(yintercept=95, linetype="dashed",  colour="red",    linewidth=0.8) +
+  geom_hline(yintercept=90, linetype="dotted",  colour="orange", linewidth=0.6) +
+  facet_wrap(~Parameter, labeller=label_parsed) +
+  scale_fill_manual(values=c("Water"="#4FC3F7","Cave"="#BCAAA4","Grass"="#A5D6A7")) +
+  scale_y_continuous(limits=c(0,105), breaks=c(0,25,50,75,90,95,100)) +
+  labs(title    = paste0("95% CI coverage (", n_valid, " replicates)"),
+       subtitle = "Error bars: MC SE | Red = 95% | Orange = 90%",
+       x="Guild", y="Coverage (%)") +
+  theme_minimal(base_size=12) +
+  theme(legend.position="none", strip.text=element_text(size=12,face="bold"))
+
+dw_df <- rbind(data.frame(Guild="Water", dw=df_w$Delta_WAIC),
+               data.frame(Guild="Cave",  dw=df_c$Delta_WAIC),
+               data.frame(Guild="Grass", dw=df_g$Delta_WAIC))
+dw_df$Guild <- factor(dw_df$Guild, levels=c("Water","Cave","Grass"))
+
+p_dw <- ggplot(dw_df, aes(Guild, dw, fill=Guild)) +
+  geom_boxplot(alpha=0.7, outlier.size=1.2) +
+  geom_hline(yintercept= 0,  linetype="dashed", colour="red",       linewidth=0.8) +
+  geom_hline(yintercept=10,  linetype="dotted", colour="darkgreen", linewidth=0.6) +
+  scale_fill_manual(values=c("Water"="#4FC3F7","Cave"="#BCAAA4","Grass"="#A5D6A7")) +
+  labs(title    = expression(paste(Delta, "WAIC across replicates")),
+       subtitle = "Positive = covariate model better | Red = 0 | Green = 10",
+       x="Guild", y=expression(Delta*"WAIC")) +
+  theme_minimal(base_size=12) + theme(legend.position="none")
+
+fig5 <- (p_cov / p_dw) + plot_annotation(
+  title    = paste0("Model Diagnostics: ", n_valid, "-Replicate Simulation Study"),
+  subtitle = "Kanto LGCP-INLA-SPDE",
+  theme    = theme(plot.title=element_text(size=14,face="bold")))
+ggsave("outputs/figures/fig05_diagnostics.pdf",
+       fig5, width=12, height=10, dpi=300)
+```
+
+```{r final_summary}
+# Console summary and full workspace save
+cat("\n=== RESULTS SUMMARY (N =", n_valid, ") ===\n")
+for (i in 1:3) {
+  cat(sprintf("\n%s:\n", sim_summary$Guild[i]))
+  cat(sprintf("  beta1 | cov: %5.1f%% (SE %4.2fpp) | bias: %6.3f | RMSE: %5.3f\n",
+              sim_summary$Coverage_beta1[i], sim_summary$MCSE_beta1[i],
+              sim_summary$Bias_beta1[i],     sim_summary$RMSE_beta1[i]))
+  cat(sprintf("  range | cov: %5.1f%% (SE %4.2fpp) | bias: %6.3f | RMSE: %5.3f\n",
+              sim_summary$Coverage_range[i], sim_summary$MCSE_range[i],
+              sim_summary$Bias_range[i],     sim_summary$RMSE_range[i]))
+  cat(sprintf("  sigma | cov: %5.1f%% (SE %4.2fpp) | bias: %6.3f | RMSE: %5.3f\n",
+              sim_summary$Coverage_sigma[i], sim_summary$MCSE_sigma[i],
+              sim_summary$Bias_sigma[i],     sim_summary$RMSE_sigma[i]))
+  cat(sprintf("  dWAIC | mean: %6.2f  sd: %5.2f | better: %5.1f%%\n",
+              sim_summary$Mean_dWAIC[i], sim_summary$SD_dWAIC[i],
+              sim_summary$Pct_cov_better[i]))
+}
+
+save(all_results, valid_results, sim_summary, df_w, df_c, df_g,
+     TRUE_PARAMS, N_REP, fit_w, fit_c, fit_g,
+     null_w, null_c, null_g, pred_w, pred_c, pred_g,
+     param_table, recovery, delta_waic, sens_df,
+     water_refs, cave_refs, grass_refs,
+     file = "outputs/simulation_study_FINAL.RData")
+
+cat("\nTables -> outputs/tables/\n")
+cat("Figures -> outputs/figures/\n")
+cat("End:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+```
