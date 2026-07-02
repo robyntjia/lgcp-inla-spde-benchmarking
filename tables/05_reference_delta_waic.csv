@@ -1,0 +1,4 @@
+"Guild","WAIC_cov","WAIC_null","Delta_WAIC","Verdict"
+"Water-type",-141.198426000282,-132.03981522653,9.16,"Covariate model better"
+"Rock/Cave-type",-192.283093266964,-188.213090083474,4.07,"Weak preference"
+"Grass/Normal-type",77.5939968907327,85.172952656289,7.58,"Covariate model better"

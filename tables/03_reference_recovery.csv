@@ -1,0 +1,4 @@
+"Guild","beta0_mean","beta0_sd","beta1_mean","beta1_sd","range_mean","sigma_mean","WAIC","logCPO","True_beta1","True_range","True_sigma","bias_beta1","bias_range","bias_sigma"
+"Grass/Normal-type",-0.334,0.296,-1.112,0.177,5.702,0.684,77.59,-38.8,-1.2,2.5,0.7,0.088,3.202,-0.016
+"Rock/Cave-type",-0.891,0.297,-2.012,0.288,2.5,0.922,-192.28,95.48,-2,1.5,1,-0.012,1,-0.078
+"Water-type",-0.459,0.317,-1.747,0.259,5.582,0.669,-141.2,70.59,-1.5,2,0.8,-0.247,3.582,-0.131
