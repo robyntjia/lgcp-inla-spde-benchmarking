@@ -1,0 +1,499 @@
+---
+title: "Sensitivity Sub-Studies: INLA Approximation Strategy and Mesh Construction"
+author: "Robyn Irawan"
+date: "2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+# Load packages and create output folders
+library(INLA)
+library(sf)
+library(spatstat)
+library(spatstat.geom)
+library(spatstat.random)
+library(Matrix)
+library(fields)
+
+dir.create("outputs",             showWarnings = FALSE)
+dir.create("outputs/tables",      showWarnings = FALSE)
+dir.create("outputs/checkpoints", showWarnings = FALSE)
+
+set.seed(888)
+
+cat("INLA version:", as.character(packageVersion("INLA")), "\n")
+
+save_csv <- function(df, filename) {
+  write.csv(df, file.path("outputs", "tables", filename), row.names = FALSE)
+}
+```
+
+```{r domain}
+# Define synthetic spatial domain S = [0,10]^2
+kanto_owin   <- owin(xrange = c(0, 10), yrange = c(0, 10))
+kanto_coords <- rbind(c(0, 0), c(10, 0), c(10, 10), c(0, 10), c(0, 0))
+kanto_sf     <- st_sf(geometry = st_sfc(st_polygon(list(kanto_coords))), crs = NA)
+```
+
+```{r reference_points}
+# Habitat reference coordinate sets F_k (see Appendix A of the manuscript)
+water_refs <- rbind(c(8.5, 4.0), c(9.0, 5.0), c(8.0, 6.0),
+                    c(4.0, 0.5), c(3.5, 1.0), c(6.0, 1.5))
+cave_refs  <- rbind(c(6.5, 5.5), c(8.5, 5.0),
+                    c(4.0, 1.0), c(2.5, 3.0), c(5.5, 3.5))
+grass_refs <- rbind(c(5.0, 3.5), c(5.0, 2.5), c(4.5, 6.5), c(7.0, 6.0))
+
+interp_safe <- function(im_obj, x, y) {
+  suppressWarnings(interp.im(im_obj, x = x, y = y, bilinear = TRUE))
+}
+
+dist_to_refs <- function(x, y, refs) {
+  dmat <- outer(seq_along(x), seq_len(nrow(refs)), function(i, j)
+    sqrt((x[i] - refs[j, 1])^2 + (y[i] - refs[j, 2])^2))
+  apply(dmat, 1, min)
+}
+
+# Terrain-distance covariate images, standardised to zero mean, unit variance
+res_grid <- 100
+xg <- seq(0, 10, length.out = res_grid)
+yg <- seq(0, 10, length.out = res_grid)
+cg <- expand.grid(x = xg, y = yg)
+
+im_w <- im(matrix(dist_to_refs(cg$x, cg$y, water_refs), nrow = res_grid, byrow = FALSE),
+          xcol = xg, yrow = yg)
+im_c <- im(matrix(dist_to_refs(cg$x, cg$y, cave_refs), nrow = res_grid, byrow = FALSE),
+          xcol = xg, yrow = yg)
+im_g <- im(matrix(dist_to_refs(cg$x, cg$y, grass_refs), nrow = res_grid, byrow = FALSE),
+          xcol = xg, yrow = yg)
+
+raw_w <- mapply(function(x, y) interp_safe(im_w, x, y), cg$x, cg$y)
+raw_c <- mapply(function(x, y) interp_safe(im_c, x, y), cg$x, cg$y)
+raw_g <- mapply(function(x, y) interp_safe(im_g, x, y), cg$x, cg$y)
+mean_w <- mean(raw_w); sd_w <- sd(raw_w)
+mean_c <- mean(raw_c); sd_c <- sd(raw_c)
+mean_g <- mean(raw_g); sd_g <- sd(raw_g)
+
+make_im_std <- function(refs, win, mu, sdv) {
+  res <- 100
+  xg <- seq(win$xrange[1], win$xrange[2], length.out = res)
+  yg <- seq(win$yrange[1], win$yrange[2], length.out = res)
+  cg <- expand.grid(x = xg, y = yg)
+  raw <- dist_to_refs(cg$x, cg$y, refs)
+  mat <- matrix((raw - mu) / sdv, nrow = res, byrow = FALSE)
+  im(mat, xcol = xg, yrow = yg)
+}
+
+im_w_std <- make_im_std(water_refs, kanto_owin, mean_w, sd_w)
+im_c_std <- make_im_std(cave_refs,  kanto_owin, mean_c, sd_c)
+im_g_std <- make_im_std(grass_refs, kanto_owin, mean_g, sd_g)
+```
+
+```{r true_params}
+# True DGP parameters and Matern GRF simulator (nu = 1)
+TRUE_PARAMS <- list(
+  water = list(alpha0 =  0.0, alpha1 = -1.5, range = 2.0, sigma = 0.8),
+  cave  = list(alpha0 = -0.7, alpha1 = -2.0, range = 1.5, sigma = 1.0),
+  grass = list(alpha0 = -0.5, alpha1 = -1.2, range = 2.5, sigma = 0.7)
+)
+
+simulate_matern_grf <- function(range_true, sigma_true, win, res = 50, seed_val) {
+  set.seed(seed_val)
+  xg    <- seq(win$xrange[1], win$xrange[2], length.out = res)
+  yg    <- seq(win$yrange[1], win$yrange[2], length.out = res)
+  cg    <- expand.grid(x = xg, y = yg)
+  kappa <- sqrt(8) / range_true
+  D     <- as.matrix(dist(cg[, 1:2]))
+  kh    <- kappa * D + 1e-8
+  Sigma <- sigma_true^2 * kh * besselK(kh, nu = 1)
+  diag(Sigma) <- sigma_true^2
+  Sigma <- Sigma + diag(1e-6, res^2)
+  L  <- chol(Sigma)
+  xi <- as.numeric(t(L) %*% rnorm(res^2))
+  im(matrix(xi, nrow = res, ncol = res, byrow = FALSE), xcol = xg, yrow = yg)
+}
+```
+
+```{r std_mesh}
+# Standard mesh (matches the main pipeline exactly)
+build_mesh <- function(max_edge, offset_vec, cutoff_val, bnd_segment) {
+  inla.mesh.2d(boundary = bnd_segment, max.edge = max_edge,
+              offset = offset_vec, cutoff = cutoff_val)
+}
+
+bnd <- inla.mesh.segment(kanto_coords[-5, ])
+
+mesh_std <- build_mesh(max_edge = c(0.35, 1.0), offset_vec = c(0.5, 1.8),
+                       cutoff_val = 0.18, bnd_segment = bnd)
+cat("Standard mesh:", mesh_std$n, "nodes,", nrow(mesh_std$graph$tv), "triangles\n")
+```
+
+```{r voronoi_helper}
+# Voronoi dual-mesh integration weights (Simpson et al. 2016)
+book.mesh.dual <- function(mesh) {
+  tv <- mesh$graph$tv
+  ce <- t(sapply(seq_len(nrow(tv)), function(i)
+    colMeans(mesh$loc[tv[i, ], 1:2])))
+  pls <- lapply(seq_len(mesh$n), function(i) {
+    p <- unique(Reduce("rbind", lapply(1:3, function(k) {
+      j <- which(tv[, k] == i)
+      if (length(j) == 0) return(NULL)
+      rbind(ce[j, , drop = FALSE],
+            0.5 * (mesh$loc[tv[j, k], 1:2] +
+                   mesh$loc[tv[j, setdiff(1:3, k)[1]], 1:2]),
+            0.5 * (mesh$loc[tv[j, k], 1:2] +
+                   mesh$loc[tv[j, setdiff(1:3, k)[2]], 1:2]))
+    })))
+    j1 <- which(mesh$segm$bnd$idx[, 1] == i)
+    j2 <- which(mesh$segm$bnd$idx[, 2] == i)
+    if (length(j1) > 0)
+      p <- unique(rbind(p,
+        0.5 * (mesh$loc[mesh$segm$bnd$idx[j1, 1], 1:2] +
+               mesh$loc[mesh$segm$bnd$idx[j1, 2], 1:2]),
+        0.5 * (mesh$loc[mesh$segm$bnd$idx[j2, 1], 1:2] +
+               mesh$loc[mesh$segm$bnd$idx[j2, 2], 1:2])))
+    p <- p[chull(p), ]
+    sp::Polygon(rbind(p, p[1, ]))
+  })
+  sp::SpatialPolygons(lapply(seq_along(pls), function(i)
+    sp::Polygons(list(pls[[i]]), i)))
+}
+
+compute_w_vec <- function(mesh) {
+  dmesh    <- book.mesh.dual(mesh)
+  dmesh_sf <- st_as_sf(dmesh)
+  kanto_v  <- st_make_valid(kanto_sf)
+  w <- numeric(mesh$n)
+  for (i in seq_len(mesh$n)) {
+    tryCatch({
+      cell  <- st_make_valid(dmesh_sf[i, ])
+      inter <- st_intersection(cell, kanto_v)
+      w[i]  <- if (nrow(inter) > 0) as.numeric(st_area(inter)) else 0
+    }, error = function(e) { w[i] <<- 0 })
+  }
+  w
+}
+
+w_vec_std <- compute_w_vec(mesh_std)
+cat("Standard mesh: total weight =", round(sum(w_vec_std), 2),
+    " | active =", sum(w_vec_std > 0), "\n")
+
+spde_std <- inla.spde2.pcmatern(mesh = mesh_std, alpha = 2,
+                                prior.range = c(2.0, 0.50),
+                                prior.sigma = c(1.0, 0.50))
+```
+
+```{r fit_function}
+# Generic LGCP fitter with configurable INLA strategy and mesh
+fit_lgcp <- function(ppp_obj, dist_im, mesh, spde, w_vec,
+                     strategy = "laplace", int_strategy = "eb") {
+  n_obs  <- npoints(ppp_obj)
+  n_mesh <- mesh$n
+
+  cov_obs  <- interp_safe(dist_im, ppp_obj$x, ppp_obj$y)
+  cov_mesh <- interp_safe(dist_im, mesh$loc[, 1], mesh$loc[, 2])
+
+  A_obs <- inla.spde.make.A(mesh = mesh, loc = cbind(ppp_obj$x, ppp_obj$y))
+  A_int <- Diagonal(n = n_mesh)
+
+  stk_obs <- inla.stack(
+    data    = list(y = rep(1L, n_obs), E = rep(0, n_obs)),
+    A       = list(A_obs, 1),
+    effects = list(s = seq_len(spde$n.spde),
+                   data.frame(intercept = 1, dist_cov = cov_obs)),
+    tag = "obs")
+  stk_int <- inla.stack(
+    data    = list(y = rep(0L, n_mesh), E = w_vec),
+    A       = list(A_int, 1),
+    effects = list(s = seq_len(spde$n.spde),
+                   data.frame(intercept = 1, dist_cov = cov_mesh)),
+    tag = "int")
+  stk_all <- inla.stack(stk_obs, stk_int)
+
+  t0  <- proc.time()
+  fit <- tryCatch(
+    inla(y ~ -1 + intercept + dist_cov + f(s, model = spde),
+        family  = "poisson",
+        data    = inla.stack.data(stk_all),
+        E       = inla.stack.data(stk_all)$E,
+        control.predictor = list(A = inla.stack.A(stk_all),
+                                 compute = FALSE, link = 1),
+        control.compute   = list(dic = FALSE, waic = FALSE,
+                                 cpo = FALSE, config = FALSE),
+        control.inla      = list(strategy = strategy, int.strategy = int_strategy),
+        verbose = FALSE),
+    error = function(e) NULL)
+  elapsed <- as.numeric((proc.time() - t0)["elapsed"])
+
+  if (is.null(fit)) {
+    return(list(beta1_mean = NA, beta1_sd = NA, beta1_lo = NA, beta1_hi = NA,
+               range_mean = NA, range_lo = NA, range_hi = NA,
+               sigma_mean = NA, sigma_lo = NA, sigma_hi = NA, elapsed = elapsed))
+  }
+
+  fx  <- fit$summary.fixed
+  spr <- tryCatch(inla.spde2.result(fit, "s", spde, do.transform = TRUE),
+                   error = function(e) NULL)
+
+  if (is.null(spr)) {
+    return(list(beta1_mean = fx["dist_cov", "mean"], beta1_sd = fx["dist_cov", "sd"],
+               beta1_lo = fx["dist_cov", "0.025quant"], beta1_hi = fx["dist_cov", "0.975quant"],
+               range_mean = NA, range_lo = NA, range_hi = NA,
+               sigma_mean = NA, sigma_lo = NA, sigma_hi = NA, elapsed = elapsed))
+  }
+
+  rm  <- spr$marginals.range.nominal[[1]]
+  sm  <- spr$marginals.variance.nominal[[1]]
+  rci <- tryCatch(inla.hpdmarginal(0.95, rm), error = function(e) matrix(c(NA, NA), nrow = 1))
+  sci <- tryCatch(inla.hpdmarginal(0.95, sm), error = function(e) matrix(c(NA, NA), nrow = 1))
+
+  list(
+    beta1_mean = fx["dist_cov", "mean"], beta1_sd = fx["dist_cov", "sd"],
+    beta1_lo   = fx["dist_cov", "0.025quant"], beta1_hi = fx["dist_cov", "0.975quant"],
+    range_mean = inla.emarginal(function(x) x, rm),
+    range_lo   = rci[1, 1], range_hi = rci[1, 2],
+    sigma_mean = sqrt(max(0, inla.emarginal(function(x) x, sm))),
+    sigma_lo   = sqrt(max(0, sci[1, 1])), sigma_hi = sqrt(max(0, sci[1, 2])),
+    elapsed    = elapsed
+  )
+}
+```
+
+```{r strategy_config}
+# Sub-study 1: four INLA approximation configurations, Water guild
+STRATEGY_CONFIGS <- list(
+  list(label = "Gaussian",                strategy = "gaussian",           int_strategy = "eb"),
+  list(label = "Simplified Laplace",      strategy = "simplified.laplace", int_strategy = "eb"),
+  list(label = "Full Laplace, eb (main)", strategy = "laplace",            int_strategy = "eb"),
+  list(label = "Full Laplace, grid",      strategy = "laplace",            int_strategy = "grid")
+)
+N_SUB_1 <- 100
+```
+
+```{r strategy_loop}
+# Loop: one Water pattern per replicate, refit under all four configurations
+t_start_1 <- proc.time()
+sub1_rows <- list()
+
+for (rep in seq_len(N_SUB_1)) {
+
+  grf_w_r <- simulate_matern_grf(TRUE_PARAMS$water$range, TRUE_PARAMS$water$sigma,
+                                  kanto_owin, seed_val = 30000 + rep)
+
+  set.seed(40000 + rep)
+  water_r <- rpoispp(
+    lambda = function(x, y)
+      pmax(0, exp(TRUE_PARAMS$water$alpha0
+                 + TRUE_PARAMS$water$alpha1 * interp_safe(im_w_std, x, y)
+                 + interp_safe(grf_w_r, x, y))),
+    win = kanto_owin)
+  n_enc <- npoints(water_r)
+
+  if (n_enc < 5) { cat("Rep", rep, "skipped: too few encounters\n"); next }
+
+  for (cfg in STRATEGY_CONFIGS) {
+    r <- fit_lgcp(water_r, im_w_std, mesh_std, spde_std, w_vec_std,
+                 strategy = cfg$strategy, int_strategy = cfg$int_strategy)
+
+    sub1_rows[[length(sub1_rows) + 1]] <- data.frame(
+      rep = rep, config = cfg$label, strategy = cfg$strategy,
+      int_strat = cfg$int_strategy, n_enc = n_enc, elapsed = r$elapsed,
+      beta1_mean = r$beta1_mean, beta1_sd = r$beta1_sd,
+      beta1_lo = r$beta1_lo, beta1_hi = r$beta1_hi,
+      range_mean = r$range_mean, range_lo = r$range_lo, range_hi = r$range_hi,
+      sigma_mean = r$sigma_mean, sigma_lo = r$sigma_lo, sigma_hi = r$sigma_hi,
+      stringsAsFactors = FALSE)
+  }
+
+  if (rep %% 10 == 0) {
+    checkpoint_df <- do.call(rbind, sub1_rows)
+    save(checkpoint_df, file = file.path("outputs", "checkpoints",
+                                         paste0("substudy1_checkpoint_rep", rep, ".RData")))
+    cat("Rep", rep, "/", N_SUB_1, "checkpoint saved\n")
+  }
+}
+
+cat("Sub-study 1 wall time:",
+    round(as.numeric((proc.time() - t_start_1)["elapsed"]) / 60, 1), "min\n")
+
+sub1_df <- do.call(rbind, sub1_rows)
+save_csv(sub1_df, "14_substudy1_approxstrat_water_by_replicate.csv")
+```
+
+```{r strategy_aggregate}
+# Aggregate Sub-study 1 with Monte Carlo standard errors
+TRUE_B1_W  <- TRUE_PARAMS$water$alpha1
+TRUE_RHO_W <- TRUE_PARAMS$water$range
+
+mc_se_prop <- function(p, n) round(100 * sqrt(p * (1 - p) / n), 2)
+
+agg_config <- function(df, cfg_label) {
+  s <- df[df$config == cfg_label, ]
+  n <- sum(!is.na(s$beta1_mean))
+
+  b1_cov  <- mean(s$beta1_lo <= TRUE_B1_W & s$beta1_hi >= TRUE_B1_W, na.rm = TRUE)
+  rho_cov <- mean(s$range_lo <= TRUE_RHO_W & s$range_hi >= TRUE_RHO_W, na.rm = TRUE)
+
+  data.frame(
+    config = cfg_label, N_valid = n,
+    beta1_coverage_pct  = round(100 * b1_cov, 1),
+    beta1_coverage_MCSE = mc_se_prop(b1_cov, n),
+    beta1_bias = round(mean(s$beta1_mean - TRUE_B1_W, na.rm = TRUE), 4),
+    beta1_RMSE = round(sqrt(mean((s$beta1_mean - TRUE_B1_W)^2, na.rm = TRUE)), 4),
+    beta1_CI_width = round(mean(s$beta1_hi - s$beta1_lo, na.rm = TRUE), 4),
+    range_coverage_pct  = round(100 * rho_cov, 1),
+    range_coverage_MCSE = mc_se_prop(rho_cov, n),
+    range_bias = round(mean(s$range_mean - TRUE_RHO_W, na.rm = TRUE), 4),
+    range_RMSE = round(sqrt(mean((s$range_mean - TRUE_RHO_W)^2, na.rm = TRUE)), 4),
+    range_CI_width = round(mean(s$range_hi - s$range_lo, na.rm = TRUE), 4),
+    mean_elapsed_sec = round(mean(s$elapsed, na.rm = TRUE), 2),
+    stringsAsFactors = FALSE)
+}
+
+sub1_summary <- do.call(rbind, lapply(sapply(STRATEGY_CONFIGS, function(c) c$label),
+                                      agg_config, df = sub1_df))
+rownames(sub1_summary) <- NULL
+save_csv(sub1_summary, "15_substudy1_approxstrat_summary_with_mcse.csv")
+print(sub1_summary)
+```
+
+```{r mesh_build}
+# Sub-study 2: three mesh configurations, Cave guild
+mesh_coarse <- build_mesh(max_edge = c(0.70, 2.0), offset_vec = c(0.5, 1.8),
+                          cutoff_val = 0.35, bnd_segment = bnd)
+mesh_fine   <- build_mesh(max_edge = c(0.20, 0.60), offset_vec = c(1.0, 2.5),
+                          cutoff_val = 0.10, bnd_segment = bnd)
+
+cat("Coarse mesh:", mesh_coarse$n, "nodes,", nrow(mesh_coarse$graph$tv), "triangles\n")
+cat("Fine mesh:  ", mesh_fine$n,   "nodes,", nrow(mesh_fine$graph$tv), "triangles\n")
+
+w_vec_coarse <- compute_w_vec(mesh_coarse)
+w_vec_fine   <- compute_w_vec(mesh_fine)
+
+spde_coarse <- inla.spde2.pcmatern(mesh = mesh_coarse, alpha = 2,
+                                   prior.range = c(2.0, 0.50), prior.sigma = c(1.0, 0.50))
+spde_fine   <- inla.spde2.pcmatern(mesh = mesh_fine, alpha = 2,
+                                   prior.range = c(2.0, 0.50), prior.sigma = c(1.0, 0.50))
+
+MESH_CONFIGS <- list(
+  list(label = "Coarse",                   mesh = mesh_coarse, spde = spde_coarse, w_vec = w_vec_coarse),
+  list(label = "Standard (main study)",     mesh = mesh_std,    spde = spde_std,    w_vec = w_vec_std),
+  list(label = "Fine + extended boundary",  mesh = mesh_fine,   spde = spde_fine,   w_vec = w_vec_fine)
+)
+
+mesh_meta <- data.frame(
+  config = c("Coarse", "Standard", "Fine + extended boundary"),
+  total_nodes  = c(mesh_coarse$n, mesh_std$n, mesh_fine$n),
+  active_nodes = c(sum(w_vec_coarse > 0), sum(w_vec_std > 0), sum(w_vec_fine > 0)),
+  total_triangles = c(nrow(mesh_coarse$graph$tv), nrow(mesh_std$graph$tv), nrow(mesh_fine$graph$tv))
+)
+save_csv(mesh_meta, "16_substudy2_mesh_configurations.csv")
+print(mesh_meta)
+```
+
+```{r mesh_loop}
+# Loop: one Cave pattern per replicate, refit under all three meshes
+N_SUB_2 <- 100
+t_start_2 <- proc.time()
+sub2_rows <- list()
+
+for (rep in seq_len(N_SUB_2)) {
+
+  grf_c_r <- simulate_matern_grf(TRUE_PARAMS$cave$range, TRUE_PARAMS$cave$sigma,
+                                  kanto_owin, seed_val = 50000 + rep)
+
+  set.seed(60000 + rep)
+  cave_r <- rpoispp(
+    lambda = function(x, y)
+      pmax(0, exp(TRUE_PARAMS$cave$alpha0
+                 + TRUE_PARAMS$cave$alpha1 * interp_safe(im_c_std, x, y)
+                 + interp_safe(grf_c_r, x, y))),
+    win = kanto_owin)
+  n_enc <- npoints(cave_r)
+
+  if (n_enc < 5) { cat("Rep", rep, "skipped: too few encounters\n"); next }
+
+  for (mcfg in MESH_CONFIGS) {
+    r <- fit_lgcp(cave_r, im_c_std, mcfg$mesh, mcfg$spde, mcfg$w_vec,
+                 strategy = "laplace", int_strategy = "eb")
+
+    sub2_rows[[length(sub2_rows) + 1]] <- data.frame(
+      rep = rep, mesh_cfg = mcfg$label, mesh_n = mcfg$mesh$n,
+      n_enc = n_enc, elapsed = r$elapsed,
+      beta1_mean = r$beta1_mean, beta1_sd = r$beta1_sd,
+      beta1_lo = r$beta1_lo, beta1_hi = r$beta1_hi,
+      range_mean = r$range_mean, range_lo = r$range_lo, range_hi = r$range_hi,
+      sigma_mean = r$sigma_mean, sigma_lo = r$sigma_lo, sigma_hi = r$sigma_hi,
+      stringsAsFactors = FALSE)
+  }
+
+  if (rep %% 10 == 0) {
+    checkpoint_df <- do.call(rbind, sub2_rows)
+    save(checkpoint_df, file = file.path("outputs", "checkpoints",
+                                         paste0("substudy2_checkpoint_rep", rep, ".RData")))
+    cat("Rep", rep, "/", N_SUB_2, "checkpoint saved\n")
+  }
+}
+
+cat("Sub-study 2 wall time:",
+    round(as.numeric((proc.time() - t_start_2)["elapsed"]) / 60, 1), "min\n")
+
+sub2_df <- do.call(rbind, sub2_rows)
+save_csv(sub2_df, "17_substudy2_meshsens_cave_by_replicate.csv")
+```
+
+```{r mesh_aggregate}
+# Aggregate Sub-study 2 with Monte Carlo standard errors
+TRUE_B1_C  <- TRUE_PARAMS$cave$alpha1
+TRUE_RHO_C <- TRUE_PARAMS$cave$range
+
+agg_mesh <- function(df, cfg_label) {
+  s <- df[df$mesh_cfg == cfg_label, ]
+  n <- sum(!is.na(s$beta1_mean))
+
+  b1_cov  <- mean(s$beta1_lo <= TRUE_B1_C & s$beta1_hi >= TRUE_B1_C, na.rm = TRUE)
+  rho_cov <- mean(s$range_lo <= TRUE_RHO_C & s$range_hi >= TRUE_RHO_C, na.rm = TRUE)
+
+  data.frame(
+    mesh_cfg = cfg_label, mesh_n = unique(s$mesh_n), N_valid = n,
+    beta1_coverage_pct  = round(100 * b1_cov, 1),
+    beta1_coverage_MCSE = mc_se_prop(b1_cov, n),
+    beta1_bias = round(mean(s$beta1_mean - TRUE_B1_C, na.rm = TRUE), 4),
+    beta1_RMSE = round(sqrt(mean((s$beta1_mean - TRUE_B1_C)^2, na.rm = TRUE)), 4),
+    range_coverage_pct  = round(100 * rho_cov, 1),
+    range_coverage_MCSE = mc_se_prop(rho_cov, n),
+    range_bias = round(mean(s$range_mean - TRUE_RHO_C, na.rm = TRUE), 4),
+    range_RMSE = round(sqrt(mean((s$range_mean - TRUE_RHO_C)^2, na.rm = TRUE)), 4),
+    mean_elapsed_sec = round(mean(s$elapsed, na.rm = TRUE), 2),
+    stringsAsFactors = FALSE)
+}
+
+sub2_summary <- do.call(rbind, lapply(sapply(MESH_CONFIGS, function(c) c$label),
+                                      agg_mesh, df = sub2_df))
+rownames(sub2_summary) <- NULL
+save_csv(sub2_summary, "18_substudy2_meshsens_summary_with_mcse.csv")
+print(sub2_summary)
+```
+
+```{r final_summary}
+# Console summary and metadata
+meta <- data.frame(
+  quantity = c("Sub-study 1: N replicates", "Sub-study 1: configurations",
+              "Sub-study 2: N replicates", "Sub-study 2: mesh configurations",
+              "Session date"),
+  value = c(N_SUB_1, length(STRATEGY_CONFIGS), N_SUB_2, length(MESH_CONFIGS),
+           format(Sys.time(), "%Y-%m-%d %H:%M:%S"))
+)
+save_csv(meta, "19_substudies_metadata.csv")
+print(meta)
+
+save(sub1_df, sub1_summary, sub2_df, sub2_summary, mesh_meta, meta,
+     N_SUB_1, N_SUB_2, STRATEGY_CONFIGS, MESH_CONFIGS,
+     file = "outputs/substudies_FINAL.RData")
+
+cat("\nTables -> outputs/tables/\n")
+cat("End:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+```
