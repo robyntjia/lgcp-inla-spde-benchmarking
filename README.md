@@ -1,5 +1,7 @@
 # Computational Benchmarking of the INLA-SPDE Approach for Spatial Point Processes: Parameter Recovery and Spatial Confounding
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21122084.svg)](https://doi.org/10.5281/zenodo.21122084)
+
 **Robyn Irawan**  
 Center for Mathematics and Society, Faculty of Science,  
 Parahyangan Catholic University (UNPAR), Bandung, West Java, Indonesia  
