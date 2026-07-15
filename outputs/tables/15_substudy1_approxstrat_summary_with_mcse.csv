@@ -1,0 +1,5 @@
+"config","N_valid","beta1_coverage_pct","beta1_coverage_MCSE","beta1_bias","beta1_RMSE","beta1_CI_width","range_coverage_pct","range_coverage_MCSE","range_bias","range_RMSE","range_CI_width","mean_elapsed_sec"
+"Gaussian",100,94,2.37,-0.0809,0.2711,0.987,90,3,1.6631,1.8901,4.8828,4.24
+"Simplified Laplace",100,94,2.37,-0.0809,0.2711,0.987,90,3,1.6631,1.8901,4.8827,4.18
+"Full Laplace, eb (main)",100,94,2.37,-0.0809,0.2711,0.987,90,3,1.6631,1.8901,4.8828,4.18
+"Full Laplace, grid",100,96,1.96,-0.0863,0.2753,1.0786,90,3,1.6631,1.8901,4.8827,5.09

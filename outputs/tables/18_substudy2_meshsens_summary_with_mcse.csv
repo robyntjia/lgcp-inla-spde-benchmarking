@@ -1,0 +1,4 @@
+"mesh_cfg","mesh_n","N_valid","beta1_coverage_pct","beta1_coverage_MCSE","beta1_bias","beta1_RMSE","range_coverage_pct","range_coverage_MCSE","range_bias","range_RMSE","mean_elapsed_sec"
+"Coarse",621,100,73,4.44,-0.3917,0.6752,28,4.49,3.0098,3.3287,1.67
+"Standard (main study)",2340,100,86,3.47,-0.1744,0.408,52,5,1.6794,1.8873,4.36
+"Fine + extended boundary",9230,100,91,2.86,-0.1293,0.345,89,3.13,1.0191,1.2658,21.79
