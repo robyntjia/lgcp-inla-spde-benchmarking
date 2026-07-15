@@ -4,7 +4,7 @@
 Center for Mathematics and Society, Faculty of Science,  
 Parahyangan Catholic University (UNPAR), Bandung, West Java, Indonesia  
 robynirawan.tjia@unpar.ac.id
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21122084.svg)](https://doi.org/10.5281/zenodo.21122084)
+
 ---
 
 ## Overview
@@ -22,7 +22,8 @@ The study benchmarks the inferential performance of the Log-Gaussian Cox Process
 ```
 lgcp-inla-spde-benchmarking/
 ├── README.md
-├── LGCP_INLA_SPDE_Benchmarking.Rmd        # Complete R pipeline
+├── LGCP_INLA_SPDE_Benchmarking.Rmd                  # Main 500-replicate pipeline
+├── Substudies_Approximation_Mesh_Sensitivity.Rmd    # Sensitivity sub-studies (Sec. 4.6, 4.7)
 └── outputs/
     └── tables/
         ├── 00_covariate_standardisation_stats.csv
@@ -36,10 +37,16 @@ lgcp-inla-spde-benchmarking/
         ├── 06_pc_prior_sensitivity.csv
         ├── 07_simulation_summary.csv
         ├── 08_simulation_summary_with_mcse.csv
-        └── 13_appendix_A_reference_coordinates.csv
+        ├── 13_appendix_A_reference_coordinates.csv
+        ├── 14_substudy1_approxstrat_water_by_replicate.csv
+        ├── 15_substudy1_approxstrat_summary_with_mcse.csv
+        ├── 16_substudy2_mesh_configurations.csv
+        ├── 17_substudy2_meshsens_cave_by_replicate.csv
+        ├── 18_substudy2_meshsens_summary_with_mcse.csv
+        └── 19_substudies_metadata.csv
 ```
 
-The `outputs/tables/` folder contains pre-computed results from the full 500-replicate run, allowing inspection of all reported numerical results without re-running the full pipeline. Running the `.Rmd` from scratch will regenerate all tables and figures.
+The main pipeline (`LGCP_INLA_SPDE_Benchmarking.Rmd`) reproduces the 500-replicate Monte Carlo study, the PC prior sensitivity analysis, and Appendix A. The sub-studies pipeline (`Substudies_Approximation_Mesh_Sensitivity.Rmd`) reproduces two targeted sensitivity analyses requested during peer review: sensitivity to the INLA approximation strategy (100 replicates, Water guild) and sensitivity to SPDE mesh construction (100 replicates, Rock/Cave guild). It is self-contained and does not depend on the main pipeline having been run first.
 
 ---
 
@@ -81,6 +88,8 @@ The `.Rmd` file contains an `installation` chunk (set to `eval=FALSE`) with the 
 
 ## How to Run
 
+### Main pipeline
+
 1. Clone or download this repository.
 2. Open `LGCP_INLA_SPDE_Benchmarking.Rmd` in RStudio.
 3. Set the working directory to the project root folder via Session → Set Working Directory → To Source File Location.
@@ -94,17 +103,27 @@ outputs/figures/      <- PDF figures
 outputs/checkpoints/  <- simulation state saved every 25 replicates
 ```
 
+### Sensitivity sub-studies
+
+1. Open `Substudies_Approximation_Mesh_Sensitivity.Rmd` in RStudio (same project root as above).
+2. Set the working directory to the project root via Session → Set Working Directory → To Source File Location.
+3. Run all chunks sequentially, or click **Knit**.
+
+This script is self-contained: it reconstructs the domain, covariates, and standard mesh from scratch, so it can be run independently of the main pipeline. It writes to the same `outputs/tables/` and `outputs/checkpoints/` folders using file prefixes `14_` through `19_`, which do not overlap with the main pipeline's `00_` through `13_` outputs.
+
 ### Expected Runtime
 
-| Component                        | Approximate time |
-|----------------------------------|-----------------|
-| Reference run and diagnostics    | 5–10 minutes    |
-| 500-replicate Monte Carlo study  | 5–7 hours       |
-| Figures and final summary        | 2–5 minutes     |
+| Component                              | Approximate time |
+|-----------------------------------------|-----------------|
+| Reference run and diagnostics          | 5–10 minutes    |
+| 500-replicate Monte Carlo study        | 5–7 hours       |
+| Figures and final summary              | 2–5 minutes     |
+| Approximation-strategy sub-study (100 reps, Water)  | ~35 minutes |
+| Mesh-sensitivity sub-study (100 reps, Cave)         | ~50–75 minutes |
 
 Tested on: Windows 11 x64, AMD Ryzen 7 8840HS, 16 GB RAM.
 
-Checkpoints are saved every 25 replicates so the simulation can be safely interrupted and resumed.
+Checkpoints are saved every 25 replicates (main pipeline) or every 10 replicates (sub-studies) so any simulation can be safely interrupted and resumed.
 
 ---
 
@@ -149,6 +168,31 @@ where X̃_k(s) is a standardised terrain-distance covariate and ξ_k(s) is a zer
 | σ         | Grass | 89.4%           | 1.38pp |
 
 Full results with bias, RMSE, and WAIC discrimination rates are in `outputs/tables/08_simulation_summary_with_mcse.csv`.
+
+---
+
+## Sensitivity Sub-Study Results (100 replicates each)
+
+**Approximation strategy (Water guild):** the choice of latent-field approximation (Gaussian, simplified Laplace, full Laplace) has negligible effect; all three agree on β1 to six decimal places. Hyperparameter integration strategy has a modest, theoretically-predicted effect: grid integration widens β1 credible intervals by 7.8% on average, lifting coverage from 94.0% (empirical Bayes) to 96.0% (grid).
+
+| Strategy                | Cov. β1 | RMSE β1 |
+|--------------------------|---------|---------|
+| Gaussian                 | 94.0%   | 0.271   |
+| Simplified Laplace       | 94.0%   | 0.271   |
+| Full Laplace, eb (main)  | 94.0%   | 0.271   |
+| Full Laplace, grid       | 96.0%   | 0.275   |
+
+Full results in `outputs/tables/15_substudy1_approxstrat_summary_with_mcse.csv`.
+
+**Mesh sensitivity (Cave guild):** range coverage climbs monotonically with mesh refinement, from 28.0% (coarse mesh) to 52.0% (standard mesh, consistent with the 55.8% obtained in the 500-replicate main study) to 89.0% (fine mesh with extended boundary). This decomposes the main-study range-coverage deficit into a substantial finite-mesh SPDE discretisation contribution, additive with the theoretical bounded-domain identifiability limit.
+
+| Mesh                       | Nodes  | Cov. β1 | Cov. ρ | RMSE ρ |
+|-----------------------------|--------|---------|--------|--------|
+| Coarse                      | 621    | 73.0%   | 28.0%  | 3.329  |
+| Standard (main study)       | 2,340  | 86.0%   | 52.0%  | 1.887  |
+| Fine + extended boundary    | 9,230  | 91.0%   | 89.0%  | 1.266  |
+
+Full results in `outputs/tables/18_substudy2_meshsens_summary_with_mcse.csv`.
 
 ---
 
